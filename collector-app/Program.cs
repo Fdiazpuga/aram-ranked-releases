@@ -31,6 +31,7 @@ static class Program
     static readonly string BaseDir = AppContext.BaseDirectory;
     static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
     static readonly string SeenPath = Path.Combine(BaseDir, "seen.json");
+    static readonly string OpeningPath = Path.Combine(BaseDir, "first-kill.json");
     static readonly string LogPath = Path.Combine(BaseDir, "recolector.log");
 
     static Config config;
@@ -40,6 +41,7 @@ static class Program
     static ToolStripMenuItem autostartItem;
     static bool polling;
     static bool clientWasClosed = true;
+    static JsonObject pendingOpening;
 
     static readonly HttpClient lcuHttp = new(new HttpClientHandler
     {
@@ -49,6 +51,11 @@ static class Program
     { Timeout = TimeSpan.FromSeconds(10) };
 
     static readonly HttpClient webHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
+    static readonly HttpClient liveHttp = new(new HttpClientHandler
+    {
+        ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+    })
+    { Timeout = TimeSpan.FromSeconds(4) };
 
     [STAThread]
     static void Main()
@@ -113,6 +120,11 @@ static class Program
         config = JsonSerializer.Deserialize<Config>(File.ReadAllText(ConfigPath)) ?? new Config();
         if (File.Exists(SeenPath))
             seen = JsonSerializer.Deserialize<HashSet<long>>(File.ReadAllText(SeenPath)) ?? new HashSet<long>();
+        if (File.Exists(OpeningPath))
+        {
+            try { pendingOpening = JsonNode.Parse(File.ReadAllText(OpeningPath)) as JsonObject; }
+            catch { pendingOpening = null; }
+        }
     }
 
     static async Task SafePoll()
@@ -137,6 +149,10 @@ static class Program
         clientWasClosed = false;
         SetStatus("Vigilando partidas nuevas", true);
 
+        // El resumen post-partida dice quién logró first blood, pero no quién
+        // murió. Mientras la partida está activa guardamos el primer ChampionKill.
+        await CaptureLiveOpening();
+
         var history = await LcuGet(creds.Value, "/lol-match-history/v1/products/lol/current-summoner/matches?begIndex=0&endIndex=14");
         if (history?["games"]?["games"] is not JsonArray games) return;
 
@@ -147,8 +163,17 @@ static class Program
 
             var full = await LcuGet(creds.Value, $"/lol-match-history/v1/games/{gameId}");
             var game = full?["gameId"] != null ? full : g;
+            bool openingAttached = OpeningMatches(game);
+            var gameForUpload = game.DeepClone();
+            if (openingAttached && gameForUpload is JsonObject gameObject)
+            {
+                gameObject["_aramRanked"] = new JsonObject
+                {
+                    ["firstKill"] = pendingOpening?["firstKill"]?.DeepClone(),
+                };
+            }
 
-            var payload = new JsonObject { ["token"] = config.ingestToken, ["game"] = game.DeepClone() };
+            var payload = new JsonObject { ["token"] = config.ingestToken, ["game"] = gameForUpload };
             using var res = await webHttp.PostAsync(
                 new Uri(new Uri(config.workerUrl), "/api/ingest"),
                 new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"));
@@ -169,7 +194,101 @@ static class Program
 
             seen.Add(gameId);
             File.WriteAllText(SeenPath, JsonSerializer.Serialize(seen));
+            if (openingAttached)
+            {
+                pendingOpening = null;
+                try { File.Delete(OpeningPath); } catch { }
+            }
         }
+    }
+
+    static string NodeString(JsonNode node, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            try
+            {
+                var value = node?[key]?.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(value)) return value;
+            }
+            catch { }
+        }
+        return "";
+    }
+
+    static double NodeNumber(JsonNode node, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (double.TryParse(node?[key]?.ToString(), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double value)) return value;
+        return 0;
+    }
+
+    static async Task<JsonNode> LiveGet(string route)
+    {
+        using var res = await liveHttp.GetAsync($"https://127.0.0.1:2999{route}");
+        if (!res.IsSuccessStatusCode) return null;
+        return JsonNode.Parse(await res.Content.ReadAsStringAsync());
+    }
+
+    static async Task CaptureLiveOpening()
+    {
+        try
+        {
+            var data = await LiveGet("/liveclientdata/eventdata");
+            var events = data?["Events"] as JsonArray ?? data?["events"] as JsonArray;
+            if (events == null) return;
+
+            JsonNode firstKill = null;
+            double firstTime = double.MaxValue;
+            foreach (var gameEvent in events)
+            {
+                if (!string.Equals(NodeString(gameEvent, "EventName", "eventName"), "ChampionKill", StringComparison.OrdinalIgnoreCase)) continue;
+                double eventTime = NodeNumber(gameEvent, "EventTime", "eventTime");
+                if (eventTime < firstTime)
+                {
+                    firstTime = eventTime;
+                    firstKill = gameEvent;
+                }
+            }
+            if (firstKill == null) return;
+
+            var stats = await LiveGet("/liveclientdata/gamestats");
+            double gameTime = NodeNumber(stats, "gameTime", "GameTime");
+            if (gameTime <= 0) return;
+            long gameStartMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(gameTime * 1000);
+            long previousStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
+            if (pendingOpening != null && Math.Abs(previousStartMs - gameStartMs) < 120_000) return;
+
+            string killerName = NodeString(firstKill, "KillerName", "killerName");
+            string victimName = NodeString(firstKill, "VictimName", "victimName");
+            if (string.IsNullOrWhiteSpace(victimName)) return;
+
+            pendingOpening = new JsonObject
+            {
+                ["gameStartMs"] = gameStartMs,
+                ["firstKill"] = new JsonObject
+                {
+                    ["killerName"] = killerName,
+                    ["victimName"] = victimName,
+                    ["eventTime"] = firstTime,
+                },
+            };
+            File.WriteAllText(OpeningPath, pendingOpening.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            Log($"⚔ Primera muerte capturada a los {Math.Round(firstTime)} s: {victimName}");
+        }
+        catch
+        {
+            // Fuera de partida el puerto 2999 no responde: es el estado normal.
+        }
+    }
+
+    static bool OpeningMatches(JsonNode game)
+    {
+        if (pendingOpening == null) return false;
+        long gameCreation = (long)NodeNumber(game, "gameCreation");
+        long gameStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
+        return gameCreation > 0 && gameStartMs > 0 && Math.Abs(gameCreation - gameStartMs) < 300_000;
     }
 
     static readonly string[] LockfileCandidates =
