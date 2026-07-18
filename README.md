@@ -12,7 +12,10 @@ que usan Blitz o Porofessor: **solo lectura** vía la API local del cliente,
 sin tocar el juego ni su memoria) y las sube al ranked del grupo.
 
 - Vive como icono en la bandeja del sistema, junto al reloj
-- Durante la partida lee el primer asesinato desde la API local del juego; al terminar sube unos KB
+- Durante la partida publica un marcador en vivo cada vez que cambia el estado
+  (con un pulso de respaldo cada 15 segundos): KDA del grupo, marcador por
+  equipos, primera sangre, "Malo Culiao" y "Verdugo" provisional
+- Al terminar detecta la partida desde el historial local y la sube al ranked
 - Necesitas una cuenta en el ranked y tu código de vinculación personal —
   sin eso, el programa no hace nada
 
@@ -24,12 +27,14 @@ fuente completo está en [`collector-app/`](collector-app/) para quien quiera
 revisarlo o compilarlo por su cuenta:
 
 ```
-dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish/v1.1.0
+dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish/v1.2.0
 ```
 
 ## Privacidad
 
-El recolector lee el historial y el primer asesinato de la partida desde las
-API locales oficiales del cliente/juego y los envía al servidor del ranked.
-No escribe nada en el juego y puedes cerrarlo cuando quieras desde el icono de
-la bandeja (Salir).
+El recolector lee el historial, la lista de jugadores, el marcador y los
+eventos de la partida desde las API locales oficiales del cliente/juego. El
+servidor conserva temporalmente una sola instantánea de la partida en vivo y
+solo muestra los datos individuales de miembros registrados del grupo. No
+escribe nada en el juego y puedes cerrarlo cuando quieras desde el icono de la
+bandeja (Salir).

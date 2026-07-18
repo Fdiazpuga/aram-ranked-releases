@@ -40,8 +40,15 @@ static class Program
     static ToolStripMenuItem statusItem;
     static ToolStripMenuItem autostartItem;
     static bool polling;
+    static bool livePolling;
     static bool clientWasClosed = true;
     static JsonObject pendingOpening;
+    static long liveGameStartMs;
+    static long lastLiveSeenMs;
+    static long lastLiveSentMs;
+    static long completedLiveStartMs;
+    static string lastLiveSignature = "";
+    static string publishedLiveSession = "";
 
     static readonly HttpClient lcuHttp = new(new HttpClientHandler
     {
@@ -109,6 +116,11 @@ static class Program
         timer.Start();
         _ = SafePoll();
 
+        var liveTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        liveTimer.Tick += async (_, _) => await SafeLivePoll();
+        liveTimer.Start();
+        _ = SafeLivePoll();
+
         Log("Recolector iniciado → " + config.workerUrl);
         Application.Run();
     }
@@ -125,6 +137,7 @@ static class Program
             try { pendingOpening = JsonNode.Parse(File.ReadAllText(OpeningPath)) as JsonObject; }
             catch { pendingOpening = null; }
         }
+        liveGameStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
     }
 
     static async Task SafePoll()
@@ -148,10 +161,6 @@ static class Program
         if (clientWasClosed) Log("Cliente de LoL detectado.");
         clientWasClosed = false;
         SetStatus("Vigilando partidas nuevas", true);
-
-        // El resumen post-partida dice quién logró first blood, pero no quién
-        // murió. Mientras la partida está activa guardamos el primer ChampionKill.
-        await CaptureLiveOpening();
 
         var history = await LcuGet(creds.Value, "/lol-match-history/v1/products/lol/current-summoner/matches?begIndex=0&endIndex=14");
         if (history?["games"]?["games"] is not JsonArray games) return;
@@ -196,6 +205,7 @@ static class Program
             File.WriteAllText(SeenPath, JsonSerializer.Serialize(seen));
             if (openingAttached)
             {
+                completedLiveStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
                 pendingOpening = null;
                 try { File.Delete(OpeningPath); } catch { }
             }
@@ -231,56 +241,128 @@ static class Program
         return JsonNode.Parse(await res.Content.ReadAsStringAsync());
     }
 
-    static async Task CaptureLiveOpening()
+    static async Task SafeLivePoll()
     {
+        if (livePolling) return;
+        livePolling = true;
         try
         {
-            var data = await LiveGet("/liveclientdata/eventdata");
-            var events = data?["Events"] as JsonArray ?? data?["events"] as JsonArray;
-            if (events == null) return;
-
-            JsonNode firstKill = null;
-            double firstTime = double.MaxValue;
-            foreach (var gameEvent in events)
-            {
-                if (!string.Equals(NodeString(gameEvent, "EventName", "eventName"), "ChampionKill", StringComparison.OrdinalIgnoreCase)) continue;
-                double eventTime = NodeNumber(gameEvent, "EventTime", "eventTime");
-                if (eventTime < firstTime)
-                {
-                    firstTime = eventTime;
-                    firstKill = gameEvent;
-                }
-            }
-            if (firstKill == null) return;
-
-            var stats = await LiveGet("/liveclientdata/gamestats");
-            double gameTime = NodeNumber(stats, "gameTime", "GameTime");
-            if (gameTime <= 0) return;
-            long gameStartMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(gameTime * 1000);
-            long previousStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
-            if (pendingOpening != null && Math.Abs(previousStartMs - gameStartMs) < 120_000) return;
-
-            string killerName = NodeString(firstKill, "KillerName", "killerName");
-            string victimName = NodeString(firstKill, "VictimName", "victimName");
-            if (string.IsNullOrWhiteSpace(victimName)) return;
-
-            pendingOpening = new JsonObject
-            {
-                ["gameStartMs"] = gameStartMs,
-                ["firstKill"] = new JsonObject
-                {
-                    ["killerName"] = killerName,
-                    ["victimName"] = victimName,
-                    ["eventTime"] = firstTime,
-                },
-            };
-            File.WriteAllText(OpeningPath, pendingOpening.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-            Log($"⚔ Primera muerte capturada a los {Math.Round(firstTime)} s: {victimName}");
+            await PollLive();
         }
         catch
         {
-            // Fuera de partida el puerto 2999 no responde: es el estado normal.
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (lastLiveSeenMs > 0 && now - lastLiveSeenMs > 60_000)
+            {
+                liveGameStartMs = 0;
+                lastLiveSignature = "";
+                publishedLiveSession = "";
+                lastLiveSeenMs = 0;
+            }
         }
+        finally { livePolling = false; }
+    }
+
+    static string LiveSignature(JsonArray players, JsonArray events)
+    {
+        var signature = new StringBuilder();
+        foreach (var player in players)
+        {
+            var scores = player?["scores"];
+            signature.Append(NodeString(player, "riotId", "summonerName"))
+                .Append('|').Append(NodeNumber(scores, "kills"))
+                .Append('/').Append(NodeNumber(scores, "deaths"))
+                .Append('/').Append(NodeNumber(scores, "assists"))
+                .Append(':').Append(player?["isDead"]?.ToString()).Append(';');
+        }
+        return signature.Append("events:").Append(events.Count).ToString();
+    }
+
+    static void CaptureLiveOpening(JsonArray events, long gameStartMs)
+    {
+        JsonNode firstKill = null;
+        double firstTime = double.MaxValue;
+        foreach (var gameEvent in events)
+        {
+            if (!string.Equals(NodeString(gameEvent, "EventName", "eventName"), "ChampionKill", StringComparison.OrdinalIgnoreCase)) continue;
+            double time = NodeNumber(gameEvent, "EventTime", "eventTime");
+            if (time < firstTime) { firstTime = time; firstKill = gameEvent; }
+        }
+        if (firstKill == null || Math.Abs(completedLiveStartMs - gameStartMs) < 120_000) return;
+        long previousStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
+        if (pendingOpening != null && Math.Abs(previousStartMs - gameStartMs) < 120_000) return;
+
+        string killerName = NodeString(firstKill, "KillerName", "killerName");
+        string victimName = NodeString(firstKill, "VictimName", "victimName");
+        if (string.IsNullOrWhiteSpace(victimName)) return;
+        pendingOpening = new JsonObject
+        {
+            ["gameStartMs"] = gameStartMs,
+            ["firstKill"] = new JsonObject
+            {
+                ["killerName"] = killerName,
+                ["victimName"] = victimName,
+                ["eventTime"] = firstTime,
+            },
+        };
+        File.WriteAllText(OpeningPath, pendingOpening.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Log($"⚔ Primera muerte capturada a los {Math.Round(firstTime)} s: {victimName}");
+    }
+
+    static async Task PollLive()
+    {
+        var statsTask = LiveGet("/liveclientdata/gamestats");
+        var playersTask = LiveGet("/liveclientdata/playerlist");
+        var eventsTask = LiveGet("/liveclientdata/eventdata");
+        await Task.WhenAll(statsTask, playersTask, eventsTask);
+
+        var stats = await statsTask;
+        var players = await playersTask as JsonArray;
+        var eventData = await eventsTask;
+        var events = eventData?["Events"] as JsonArray ?? eventData?["events"] as JsonArray;
+        double gameTime = NodeNumber(stats, "gameTime", "GameTime");
+        if (gameTime <= 0 || players == null || events == null) return;
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long estimatedStartMs = now - (long)(gameTime * 1000);
+        if (liveGameStartMs == 0 || Math.Abs(liveGameStartMs - estimatedStartMs) >= 120_000)
+        {
+            liveGameStartMs = estimatedStartMs;
+            lastLiveSignature = "";
+            publishedLiveSession = "";
+        }
+        lastLiveSeenMs = now;
+        CaptureLiveOpening(events, liveGameStartMs);
+
+        string signature = LiveSignature(players, events);
+        bool changed = signature != lastLiveSignature;
+        bool heartbeatDue = now - lastLiveSentMs >= 15_000;
+        if (!changed && !heartbeatDue) return;
+
+        string sessionId = $"live-{liveGameStartMs}";
+        var live = new JsonObject
+        {
+            ["sessionId"] = sessionId,
+            ["startedAtMs"] = liveGameStartMs,
+            ["gameTime"] = gameTime,
+            ["gameMode"] = NodeString(stats, "gameMode", "GameMode"),
+            ["players"] = players.DeepClone(),
+            ["events"] = events.DeepClone(),
+        };
+        var payload = new JsonObject { ["token"] = config.ingestToken, ["live"] = live };
+        using var response = await webHttp.PostAsync(
+            new Uri(new Uri(config.workerUrl), "/api/live"),
+            new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"));
+        if (!response.IsSuccessStatusCode) return;
+
+        lastLiveSignature = signature;
+        lastLiveSentMs = now;
+        if (publishedLiveSession != sessionId)
+        {
+            publishedLiveSession = sessionId;
+            Log("🔴 Partida en vivo publicada en el ranked");
+        }
+        SetStatus($"Partida en vivo · {Math.Floor(gameTime / 60):00}:{Math.Floor(gameTime % 60):00}", true);
     }
 
     static bool OpeningMatches(JsonNode game)
