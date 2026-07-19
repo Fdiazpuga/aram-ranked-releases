@@ -276,6 +276,10 @@ static class Program
         clientWasClosed = false;
         SetStatus("Vigilando partidas nuevas", true);
 
+        // Publica únicamente Riot ID y estado mínimo de los contactos del grupo.
+        // Si chat no está listo todavía, no debe impedir la captura de partidas.
+        try { await PublishPresence(creds.Value); } catch { }
+
         var history = await LcuGet(creds.Value, "/lol-match-history/v1/products/lol/current-summoner/matches?begIndex=0&endIndex=14");
         if (history?["games"]?["games"] is not JsonArray games) return;
 
@@ -346,6 +350,56 @@ static class Program
             if (double.TryParse(node?[key]?.ToString(), System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out double value)) return value;
         return 0;
+    }
+
+    static JsonObject PresenceSummary(JsonNode contact)
+    {
+        if (contact == null) return null;
+        var lol = contact?["lol"];
+        string riotId = NodeString(contact, "riotId");
+        string gameName = NodeString(contact, "gameName", "riotIdGameName");
+        if (string.IsNullOrWhiteSpace(gameName)) gameName = NodeString(lol, "gameName");
+        string tagLine = NodeString(contact, "gameTag", "tagLine", "riotIdTagLine");
+        if (string.IsNullOrWhiteSpace(tagLine)) tagLine = NodeString(lol, "gameTag", "tagLine");
+        if (string.IsNullOrWhiteSpace(riotId) && !string.IsNullOrWhiteSpace(gameName) && !string.IsNullOrWhiteSpace(tagLine))
+            riotId = $"{gameName}#{tagLine}";
+        if (!riotId.Contains('#')) return null;
+        string gameStatus = NodeString(contact, "gameStatus");
+        if (string.IsNullOrWhiteSpace(gameStatus)) gameStatus = NodeString(lol, "gameStatus");
+        return new JsonObject
+        {
+            ["riotId"] = riotId,
+            ["availability"] = NodeString(contact, "availability", "status"),
+            ["gameStatus"] = gameStatus,
+        };
+    }
+
+    static async Task PublishPresence((int port, string password) creds)
+    {
+        var meTask = LcuGet(creds, "/lol-chat/v1/me");
+        var friendsTask = LcuGet(creds, "/lol-chat/v1/friends");
+        await Task.WhenAll(meTask, friendsTask);
+
+        var presence = new JsonArray();
+        var me = PresenceSummary(await meTask);
+        if (me != null) presence.Add(me);
+        var friendsNode = await friendsTask;
+        var friends = friendsNode as JsonArray ?? friendsNode?["friends"] as JsonArray;
+        if (friends != null)
+        {
+            foreach (var friend in friends)
+            {
+                var summary = PresenceSummary(friend);
+                if (summary != null) presence.Add(summary);
+            }
+        }
+        if (presence.Count == 0) return;
+
+        var payload = new JsonObject { ["token"] = config.ingestToken, ["presence"] = presence };
+        using var response = await webHttp.PostAsync(
+            new Uri(new Uri(config.workerUrl), "/api/presence"),
+            new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"));
+        response.EnsureSuccessStatusCode();
     }
 
     static async Task<JsonNode> LiveGet(string route)
