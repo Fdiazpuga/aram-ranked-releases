@@ -27,6 +27,7 @@ static class Program
 {
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string RunValue = "RecolectorARAM";
+    const int UpdateCheckHours = 6;
 
     static readonly string BaseDir = AppContext.BaseDirectory;
     static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
@@ -39,8 +40,10 @@ static class Program
     static NotifyIcon tray;
     static ToolStripMenuItem statusItem;
     static ToolStripMenuItem autostartItem;
+    static ToolStripMenuItem updateItem;
     static bool polling;
     static bool livePolling;
+    static bool checkingUpdate;
     static bool clientWasClosed = true;
     static JsonObject pendingOpening;
     static long liveGameStartMs;
@@ -49,6 +52,10 @@ static class Program
     static long completedLiveStartMs;
     static string lastLiveSignature = "";
     static string publishedLiveSession = "";
+    static string notifiedUpdateVersion = "";
+    static CollectorUpdateManifest availableUpdate;
+
+    static string CurrentVersion => typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
 
     static readonly HttpClient lcuHttp = new(new HttpClientHandler
     {
@@ -58,6 +65,7 @@ static class Program
     { Timeout = TimeSpan.FromSeconds(10) };
 
     static readonly HttpClient webHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
+    static readonly HttpClient updateHttp = new() { Timeout = TimeSpan.FromMinutes(5) };
     static readonly HttpClient liveHttp = new(new HttpClientHandler
     {
         ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
@@ -95,6 +103,13 @@ static class Program
 
         var menu = new ContextMenuStrip();
         statusItem = new ToolStripMenuItem("Iniciando…") { Enabled = false };
+        var versionItem = new ToolStripMenuItem($"Versión {CurrentVersion}") { Enabled = false };
+        updateItem = new ToolStripMenuItem("Buscar actualizaciones");
+        updateItem.Click += async (_, _) =>
+        {
+            if (availableUpdate == null) await CheckForUpdates(true);
+            if (availableUpdate != null) await InstallUpdate(availableUpdate);
+        };
         autostartItem = new ToolStripMenuItem("Iniciar con Windows") { CheckOnClick = true, Checked = IsAutostart() };
         autostartItem.CheckedChanged += (_, _) => SetAutostart(autostartItem.Checked);
         var openItem = new ToolStripMenuItem("Abrir el ranked");
@@ -103,6 +118,8 @@ static class Program
         exitItem.Click += (_, _) => { tray.Visible = false; Application.Exit(); };
 
         menu.Items.Add(statusItem);
+        menu.Items.Add(versionItem);
+        menu.Items.Add(updateItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(openItem);
         menu.Items.Add(autostartItem);
@@ -110,6 +127,10 @@ static class Program
         menu.Items.Add(exitItem);
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += (_, _) => Process.Start(new ProcessStartInfo(config.workerUrl) { UseShellExecute = true });
+        tray.BalloonTipClicked += async (_, _) =>
+        {
+            if (availableUpdate != null) await InstallUpdate(availableUpdate);
+        };
 
         var timer = new System.Windows.Forms.Timer { Interval = Math.Max(10, config.pollSeconds) * 1000 };
         timer.Tick += async (_, _) => await SafePoll();
@@ -121,7 +142,12 @@ static class Program
         liveTimer.Start();
         _ = SafeLivePoll();
 
-        Log("Recolector iniciado → " + config.workerUrl);
+        var updateTimer = new System.Windows.Forms.Timer { Interval = UpdateCheckHours * 60 * 60 * 1000 };
+        updateTimer.Tick += async (_, _) => await CheckForUpdates(false);
+        updateTimer.Start();
+        _ = CheckForUpdates(false);
+
+        Log($"Recolector v{CurrentVersion} iniciado → {config.workerUrl}");
         Application.Run();
     }
 
@@ -138,6 +164,94 @@ static class Program
             catch { pendingOpening = null; }
         }
         liveGameStartMs = (long)NodeNumber(pendingOpening, "gameStartMs");
+    }
+
+    static async Task CheckForUpdates(bool manual)
+    {
+        if (checkingUpdate) return;
+        checkingUpdate = true;
+        updateItem.Enabled = false;
+        if (manual) updateItem.Text = "Buscando actualización…";
+        try
+        {
+            var manifest = await CollectorUpdater.FetchManifest(updateHttp, config.workerUrl);
+            if (CollectorUpdater.IsNewer(manifest.Version, CurrentVersion))
+            {
+                availableUpdate = manifest;
+                updateItem.Text = $"Actualizar a v{manifest.Version}";
+                updateItem.Enabled = true;
+                if (notifiedUpdateVersion != manifest.Version)
+                {
+                    notifiedUpdateVersion = manifest.Version;
+                    tray.ShowBalloonTip(
+                        8000,
+                        "Actualización disponible",
+                        $"Recolector v{manifest.Version} está listo. Haz clic aquí o abre el menú de la bandeja para actualizar.",
+                        ToolTipIcon.Info);
+                    Log($"Actualización disponible: v{CurrentVersion} → v{manifest.Version}");
+                }
+            }
+            else
+            {
+                availableUpdate = null;
+                updateItem.Text = "Buscar actualizaciones";
+                updateItem.Enabled = true;
+                if (manual)
+                    MessageBox.Show(
+                        $"Ya tienes la versión más reciente (v{CurrentVersion}).",
+                        "Recolector ARAM Caos",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            updateItem.Text = availableUpdate == null ? "Buscar actualizaciones" : $"Actualizar a v{availableUpdate.Version}";
+            updateItem.Enabled = true;
+            Log("No se pudo buscar actualizaciones: " + ex.Message);
+            if (manual)
+                MessageBox.Show(
+                    "No se pudo comprobar si hay una actualización. Revisa tu conexión e intenta nuevamente.",
+                    "Recolector ARAM Caos",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+        }
+        finally { checkingUpdate = false; }
+    }
+
+    static async Task InstallUpdate(CollectorUpdateManifest manifest)
+    {
+        if (MessageBox.Show(
+            $"Se descargará e instalará la versión {manifest.Version}. El recolector se cerrará y volverá a abrir automáticamente.",
+            "Actualizar Recolector ARAM Caos",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Information) != DialogResult.Yes) return;
+
+        updateItem.Text = $"Descargando v{manifest.Version}…";
+        updateItem.Enabled = false;
+        try
+        {
+            string installerPath = await CollectorUpdater.DownloadAndVerify(updateHttp, manifest);
+            Log($"Instalador v{manifest.Version} descargado y verificado.");
+            Process.Start(new ProcessStartInfo(installerPath)
+            {
+                Arguments = "/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS",
+                UseShellExecute = true,
+            });
+            tray.Visible = false;
+            Application.Exit();
+        }
+        catch (Exception ex)
+        {
+            Log("No se pudo instalar la actualización: " + ex.Message);
+            updateItem.Text = $"Actualizar a v{manifest.Version}";
+            updateItem.Enabled = true;
+            MessageBox.Show(
+                "La actualización no se instaló porque no fue posible descargarla o verificarla.",
+                "Recolector ARAM Caos",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     static async Task SafePoll()

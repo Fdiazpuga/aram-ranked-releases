@@ -8,7 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RecolectorARAM</AssemblyName>
     <AssemblyTitle>Recolector — Ranked ARAM Caos</AssemblyTitle>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
+    <AssemblyVersion>1.3.0.0</AssemblyVersion>
+    <FileVersion>1.3.0.0</FileVersion>
+    <InformationalVersion>1.3.0</InformationalVersion>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 

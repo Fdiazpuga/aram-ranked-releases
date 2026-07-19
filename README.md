@@ -16,6 +16,8 @@ sin tocar el juego ni su memoria) y las sube al ranked del grupo.
   (con un pulso de respaldo cada 15 segundos): KDA del grupo, marcador por
   equipos, primera sangre, "Malo Culiao" y "Verdugo" provisional
 - Al terminar detecta la partida desde el historial local y la sube al ranked
+- Desde v1.3.0 avisa cuando hay una actualización y permite instalarla desde
+  el menú de bandeja; verifica el SHA-256 antes de ejecutar el instalador
 - Necesitas una cuenta en el ranked y tu código de vinculación personal —
   sin eso, el programa no hace nada
 
@@ -27,7 +29,7 @@ fuente completo está en [`collector-app/`](collector-app/) para quien quiera
 revisarlo o compilarlo por su cuenta:
 
 ```
-dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish/v1.2.0
+dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish/v1.3.0
 ```
 
 ## Privacidad
